@@ -1,0 +1,49 @@
+# name: test/sql/pipe_diagnostics.test
+# group: [sql]
+
+# Failed pipes retain bounded diagnostic output without becoming successful.
+require shellfs
+
+statement error
+SELECT content FROM read_text('printf "fatal: missing worktree\n"; exit 128 |');
+----
+<REGEX>:(?s).*code=128:.*Pipe output:\nfatal: missing worktree.*
+
+statement error
+SELECT content FROM read_text('exit 128 |');
+----
+Pipe process exited abnormally code=128: exit 128 |
+
+statement error
+SELECT content FROM read_text('printf "%05000d" 0; printf "\nlast diagnostic\n"; exit 128 |');
+----
+<REGEX>:(?s).*code=128:.*Pipe output \(last 4096 bytes; truncated\):\n0{1000}0{1000}0{1000}0{1000}0{79}\nlast diagnostic.*
+
+query T
+SELECT content FROM read_text('printf "success" |');
+----
+success
+
+query T
+SELECT content FROM read_text('printf "allowed"; exit 128 {allowed_exit_codes=128}|');
+----
+allowed
+
+# A second query after each error must still work; Close must not throw twice.
+query I
+SELECT 42;
+----
+42
+
+skipif windows
+statement error
+SELECT content FROM read_text('printf "signal diagnostic\n"; kill -TERM $$ |');
+----
+<REGEX>:(?s).*signal=15:.*Pipe output:\nsignal diagnostic.*
+
+# Binary pipes must not inject NUL or invalid UTF-8 into the exception.
+statement error
+SELECT content FROM read_blob('printf "\000\377tail"; exit 128 |');
+----
+<REGEX>:(?s).*code=128:.*Pipe output:\n\\x00\\xFFtail.*
+

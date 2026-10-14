@@ -4,6 +4,8 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/limits.hpp"
+#include "duckdb/common/types/blob.hpp"
+#include "utf8proc_wrapper.hpp"
 
 #include <iostream>
 #include <string>
@@ -163,6 +165,40 @@ namespace duckdb
 	private:
 		FILE *pipe;
 		std::unordered_set<int> allowed_exit_codes;
+		static constexpr size_t OUTPUT_TAIL_LIMIT = 4096;
+		std::string output_tail;
+		bool output_truncated = false;
+
+		void RememberOutput(const char *data, size_t size)
+		{
+			if (size >= OUTPUT_TAIL_LIMIT)
+			{
+				output_truncated = output_truncated || !output_tail.empty() || size > OUTPUT_TAIL_LIMIT;
+				output_tail.assign(data + size - OUTPUT_TAIL_LIMIT, OUTPUT_TAIL_LIMIT);
+				return;
+			}
+			if (output_tail.size() + size > OUTPUT_TAIL_LIMIT)
+			{
+				output_tail.erase(0, output_tail.size() + size - OUTPUT_TAIL_LIMIT);
+				output_truncated = true;
+			}
+			output_tail.append(data, size);
+		}
+
+		std::string OutputDiagnostic() const
+		{
+			if (output_tail.empty())
+			{
+				return "";
+			}
+			// A byte boundary may split UTF-8, and pipes may contain binary data.
+			// Use DuckDB's blob rendering rather than passing invalid text to an error transport.
+			auto text = output_tail.find('\0') == std::string::npos &&
+			            Utf8Proc::IsValid(output_tail.data(), output_tail.size())
+			                ? output_tail
+			                : Blob::ToString(string_t(output_tail));
+			return std::string(output_truncated ? "\nPipe output (last 4096 bytes; truncated):\n" : "\nPipe output:\n") + text;
+		}
 
 	public:
 		void Close() override
@@ -195,19 +231,19 @@ namespace duckdb
 					int exit_status = WEXITSTATUS(result);
 					if (allowed_exit_codes.find(exit_status) == allowed_exit_codes.end())
 					{
-						throw IOException("Pipe process exited abnormally code=%d: %s", exit_status, path);
+						throw IOException("Pipe process exited abnormally code=%d: %s%s", exit_status, path, OutputDiagnostic());
 					}
 				}
 				else if (WIFSIGNALED(result))
 				{
 					int signal_number = WTERMSIG(result);
-					throw IOException("Pipe process exited with signal signal=%d: %s", signal_number, path);
+					throw IOException("Pipe process exited with signal signal=%d: %s%s", signal_number, path, OutputDiagnostic());
 				}
 #else
 				// On Windows, _pclose() returns the exit status directly
 				if (allowed_exit_codes.find(result) == allowed_exit_codes.end())
 				{
-					throw IOException("Pipe process exited abnormally code=%d: %s", result, path);
+					throw IOException("Pipe process exited abnormally code=%d: %s%s", result, path, OutputDiagnostic());
 				}
 #endif
 			}
@@ -240,6 +276,10 @@ namespace duckdb
 			// having the close, by doing this if there are errors with the pipe they are caught in the query
 			// rather than in the destructor.
 			handle.Close();
+		}
+		else
+		{
+			handle.Cast<ShellFileHandle>().RememberOutput(static_cast<const char *>(buffer), size_t(bytes_read));
 		}
 		return bytes_read;
 	}
